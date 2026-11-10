@@ -1,0 +1,134 @@
+name: Deploy my EdgeEver
+
+# 自动把上游最新稳定版部署到 edgeever.fefecher.workers.dev
+# 触发方式：每天定时检查 / 手动点 Run workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "强制重新部署（即使线上已是最新版本）"
+        type: boolean
+        default: false
+  schedule:
+    # UTC 03:00 = 北京时间 11:00
+    - cron: "0 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: edgeever-personal-deploy
+  cancel-in-progress: false
+
+env:
+  CLOUDFLARE_ACCOUNT_ID: "9aa1d6803c5f9377bc70a274d07173e0"
+  EDGE_EVER_WORKER_NAME: "edgeever"
+  EDGE_EVER_D1_DATABASE_NAME: "edgeever"
+  EDGE_EVER_D1_DATABASE_ID: "73657834-2b6d-4b41-9a77-988f3e5157ec"
+  EDGE_EVER_R2_BUCKET_NAME: "edgeever-fefecher"
+  EDGE_EVER_R2_PREVIEW_BUCKET_NAME: "edgeever-fefecher"
+  EDGE_EVER_AUTH_USERNAME: "ormmi"
+  EDGE_EVER_DEPLOYMENT_URL: "https://edgeever.fefecher.workers.dev"
+  EDGE_EVER_DEPLOYMENT_TRIGGER: "github_actions"
+  EDGE_EVER_DEPLOYMENT_METHOD: "github_actions"
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Resolve upstream release
+        id: rel
+        run: |
+          set -euo pipefail
+          tag=$(curl -sSL --retry 3 --max-time 20 \
+            https://api.github.com/repos/tianma-if/edgeever/releases/latest \
+            | jq -r '.tag_name // ""')
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::无法解析上游最新版本，得到: ${tag:-空}"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "上游最新版本: $tag"
+
+      - name: Read live version
+        id: live
+        run: |
+          set -euo pipefail
+          live=$(curl -sS --max-time 15 \
+            "${EDGE_EVER_DEPLOYMENT_URL}/api/release" \
+            | jq -r '.version // ""' 2>/dev/null | sed 's/^v//' || true)
+          echo "live=$live" >> "$GITHUB_OUTPUT"
+          echo "线上当前版本: ${live:-读取失败}"
+
+      - name: Decide whether to deploy
+        id: gate
+        run: |
+          set -euo pipefail
+          force="${{ github.event.inputs.force == 'true' }}"
+          live="${{ steps.live.outputs.live }}"
+          target="${{ steps.rel.outputs.version }}"
+          if [[ "$force" != "true" && -n "$live" && "$live" == "$target" ]]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "线上已是 v${target}，本次跳过。"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "准备部署 v${target}（线上: ${live:-未知}）"
+          fi
+
+      - name: Checkout upstream source at release tag
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ steps.rel.outputs.tag }}" \
+            https://github.com/tianma-if/edgeever.git .
+          echo "头提交: $(git rev-parse --short HEAD)"
+
+      - name: Set up Bun
+        if: steps.gate.outputs.run == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if bun install --frozen-lockfile; then
+              exit 0
+            fi
+            if [[ "$attempt" == "3" ]]; then
+              exit 1
+            fi
+            sleep "$((15 * attempt))"
+          done
+
+      - name: Build and deploy
+        if: steps.gate.outputs.run == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: bun run deploy
+
+      - name: Verify live version
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          expected="${{ steps.rel.outputs.version }}"
+          actual=""
+          for i in 1 2 3 4 5; do
+            actual=$(curl -sS --max-time 15 \
+              "${EDGE_EVER_DEPLOYMENT_URL}/api/release" \
+              | jq -r '.version // ""' 2>/dev/null | sed 's/^v//' || true)
+            if [[ "$actual" == "$expected" ]]; then break; fi
+            sleep 5
+          done
+          if [[ "$actual" != "$expected" ]]; then
+            echo "::error::线上版本 v${actual:-未知}，期望 v${expected}"
+            exit 1
+          fi
+          echo "::notice::部署成功，线上版本 v${actual}"
