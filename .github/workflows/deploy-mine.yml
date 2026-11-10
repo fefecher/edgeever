@@ -74,7 +74,7 @@ jobs:
         id: gate
         run: |
           set -euo pipefail
-          force="${{ github.event.inputs.force == 'true' }}"
+          force="${{ github.event.inputs.force == 'true' || github.event_name == 'push' }}"
           live="${{ steps.live.outputs.live }}"
           target="${{ steps.rel.outputs.version }}"
           if [[ "$force" != "true" && -n "$live" && "$live" == "$target" ]]; then
